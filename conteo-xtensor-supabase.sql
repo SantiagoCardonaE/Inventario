@@ -1,6 +1,6 @@
 -- Conteo físico Xtensor: ejecutar completo en Supabase SQL Editor.
 -- Cambie los PIN iniciales en el INSERT de access_roles antes de ejecutar en producción.
-create extension if not exists pgcrypto;
+create extension if not exists pgcrypto with schema extensions;
 
 create table if not exists public.access_roles (
   role_code text primary key,
@@ -9,12 +9,12 @@ create table if not exists public.access_roles (
   is_admin boolean not null default false
 );
 insert into public.access_roles(role_code,display_name,pin_hash,is_admin) values
-('admin','Administrador',crypt('Admin-Xtensor-2026',gen_salt('bf')),true),
-('operario_1','Operario 1',crypt('Operario1-2026',gen_salt('bf')),false),
-('operario_2','Operario 2',crypt('Operario2-2026',gen_salt('bf')),false),
-('operario_3','Operario 3',crypt('Operario3-2026',gen_salt('bf')),false),
-('operario_4','Operario 4',crypt('Operario4-2026',gen_salt('bf')),false),
-('operario_5','Operario 5',crypt('Operario5-2026',gen_salt('bf')),false)
+('admin','Administrador',extensions.crypt('Admin-Xtensor-2026',extensions.gen_salt('bf')),true),
+('operario_1','Operario 1',extensions.crypt('Operario1-2026',extensions.gen_salt('bf')),false),
+('operario_2','Operario 2',extensions.crypt('Operario2-2026',extensions.gen_salt('bf')),false),
+('operario_3','Operario 3',extensions.crypt('Operario3-2026',extensions.gen_salt('bf')),false),
+('operario_4','Operario 4',extensions.crypt('Operario4-2026',extensions.gen_salt('bf')),false),
+('operario_5','Operario 5',extensions.crypt('Operario5-2026',extensions.gen_salt('bf')),false)
 on conflict(role_code) do nothing;
 
 create table if not exists public.inventory_items (
@@ -44,7 +44,7 @@ create or replace function public.inventory_login(p_role text,p_pin text) return
 declare r public.access_roles%rowtype; t uuid;
 begin
  select * into r from public.access_roles as ar where ar.role_code=p_role;
- if not found or (r.is_admin and crypt(p_pin,r.pin_hash)<>r.pin_hash) then raise exception 'Perfil o PIN incorrecto'; end if;
+ if not found or (r.is_admin and extensions.crypt(p_pin,r.pin_hash)<>r.pin_hash) then raise exception 'Perfil o PIN incorrecto'; end if;
  delete from public.inventory_sessions where expires_at<now();
  insert into public.inventory_sessions(role_code) values(r.role_code) returning inventory_sessions.token into t;
  return query select t,r.role_code,r.display_name,r.is_admin;
