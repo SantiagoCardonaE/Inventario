@@ -43,8 +43,8 @@ $$;
 create or replace function public.inventory_login(p_role text,p_pin text) returns table(token uuid,role_code text,display_name text,is_admin boolean) language plpgsql security definer set search_path=public as $$
 declare r public.access_roles%rowtype; t uuid;
 begin
- select * into r from public.access_roles where role_code=p_role;
- if not found or crypt(p_pin,r.pin_hash)<>r.pin_hash then raise exception 'Perfil o PIN incorrecto'; end if;
+ select * into r from public.access_roles as ar where ar.role_code=p_role;
+ if not found or (r.is_admin and crypt(p_pin,r.pin_hash)<>r.pin_hash) then raise exception 'Perfil o PIN incorrecto'; end if;
  delete from public.inventory_sessions where expires_at<now();
  insert into public.inventory_sessions(role_code) values(r.role_code) returning inventory_sessions.token into t;
  return query select t,r.role_code,r.display_name,r.is_admin;
