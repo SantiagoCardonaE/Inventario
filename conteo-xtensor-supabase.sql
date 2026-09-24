@@ -94,10 +94,38 @@ end; $$;
 drop function if exists public.inventory_admin_tasks(uuid);
 create function public.inventory_admin_tasks(p_token uuid) returns table(id uuid,product_code text,product_name text,unit text,category text,system_quantity numeric,unit_value numeric,warehouse_code text,assigned_role text,counted_quantity numeric,observation text,counted_at date,last_actor text,last_recorded_at timestamptz) language plpgsql security definer set search_path=public as $$
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
- return query select t.id,i.product_code,i.product_name,i.unit,i.category,i.system_quantity,i.unit_value,i.warehouse_code,t.assigned_role,t.counted_quantity,t.observation,t.counted_at,a.display_name,a.recorded_at from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id left join lateral (select coalesce(ca.responsible_name,ar.display_name) as display_name,ca.recorded_at from public.count_activity ca join public.access_roles ar on ar.role_code=ca.actor_role where ca.task_id=t.id order by ca.recorded_at desc limit 1) a on true order by i.product_code; end; $$;
-create or replace function public.inventory_activity(p_token uuid,p_limit integer default 500) returns table(product_code text,product_name text,display_name text,counted_quantity numeric,observation text,recorded_at timestamptz) language plpgsql security definer set search_path=public as $$
+ return query select t.id,i.product_code,i.product_name,i.unit,i.category,i.system_quantity,i.unit_value,i.warehouse_code,t.assigned_role,t.counted_quantity,t.observation,t.counted_at,a.display_name,a.recorded_at from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id left join lateral (select coalesce(ca.responsible_name,ar.display_name) as display_name,ca.recorded_at from public.count_activity ca join public.access_roles ar on ar.role_code=ca.actor_role where ca.task_id=t.id order by ca.recorded_at desc,ca.id desc limit 1) a on true order by i.product_code; end; $$;
+drop function if exists public.inventory_activity(uuid,integer);
+create function public.inventory_activity(p_token uuid,p_limit integer default 500) returns table(activity_id text,product_code text,product_name text,display_name text,counted_quantity numeric,observation text,recorded_at timestamptz) language plpgsql security definer set search_path=public as $$
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
- return query select t.product_code,t.product_name,coalesce(ca.responsible_name,ar.display_name),ca.counted_quantity,ca.observation,ca.recorded_at from public.count_activity ca join public.count_tasks t on t.id=ca.task_id join public.access_roles ar on ar.role_code=ca.actor_role order by ca.recorded_at desc limit greatest(1,least(coalesce(p_limit,500),2000)); end; $$;
+ return query select ca.id::text,t.product_code,t.product_name,coalesce(ca.responsible_name,ar.display_name),ca.counted_quantity,ca.observation,ca.recorded_at from public.count_activity ca join public.count_tasks t on t.id=ca.task_id join public.access_roles ar on ar.role_code=ca.actor_role order by ca.recorded_at desc,ca.id desc limit greatest(1,least(coalesce(p_limit,500),2000)); end; $$;
+
+-- Solo el administrador puede eliminar un registro y reconstruir el conteo vigente.
+create or replace function public.inventory_delete_activity(p_token uuid,p_activity bigint)
+returns void language plpgsql security definer set search_path=public as $$
+declare target_task uuid; previous public.count_activity%rowtype;
+begin
+ if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
+ select task_id into target_task from public.count_activity where id=p_activity;
+ if not found then raise exception 'El registro ya no existe. Actualice la bitácora.'; end if;
+ -- Mismo bloqueo que utiliza el guardado de conteos: serializa cambios por producto.
+ perform 1 from public.count_tasks where id=target_task for update;
+ delete from public.count_activity where id=p_activity and task_id=target_task;
+ if not found then raise exception 'El registro ya fue eliminado.'; end if;
+ select * into previous from public.count_activity where task_id=target_task
+ order by recorded_at desc,id desc limit 1;
+ if found then
+  update public.count_tasks set counted_quantity=previous.counted_quantity,
+   observation=previous.observation,
+   counted_at=case when previous.counted_quantity is null then null else (previous.recorded_at at time zone 'America/Bogota')::date end,
+   updated_at=now() where id=target_task;
+ else
+  update public.count_tasks set counted_quantity=null,observation=null,counted_at=null,updated_at=now() where id=target_task;
+ end if;
+end; $$;
+revoke all on function public.inventory_delete_activity(uuid,bigint) from public;
+grant execute on function public.inventory_delete_activity(uuid,bigint) to anon,authenticated;
+
 create or replace function public.inventory_assign(p_token uuid,p_task uuid,p_role text) returns void language plpgsql security definer set search_path=public as $$
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if; update public.count_tasks set assigned_role=nullif(p_role,''),updated_at=now() where id=p_task; end; $$;
 grant execute on function public.inventory_login(text,text,text),public.inventory_tasks(uuid,text,text),public.inventory_summary(uuid),public.inventory_save_count(uuid,uuid,numeric,text),public.inventory_admin_tasks(uuid),public.inventory_activity(uuid,integer),public.inventory_assign(uuid,uuid,text) to anon,authenticated;
