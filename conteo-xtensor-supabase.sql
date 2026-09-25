@@ -1,4 +1,7 @@
--- Conteo físico Xtensor: ejecutar completo en Supabase SQL Editor.
+-- Conteo físico Xtensor: archivo único de instalación y actualización.
+-- Ejecutar completo en Supabase SQL Editor antes de publicar conteo-xtensor.html en Vercel.
+-- Conserva conteos, bitácora, materiales agregados y claves existentes.
+begin;
 -- Cambie los PIN iniciales en el INSERT de access_roles antes de ejecutar en producción.
 create extension if not exists pgcrypto with schema extensions;
 
@@ -14,14 +17,16 @@ insert into public.access_roles(role_code,display_name,pin_hash,is_admin) values
 ('admin','Administrador',extensions.crypt('planta2026',extensions.gen_salt('bf')),true),
 ('operario','Operario',extensions.crypt('operario',extensions.gen_salt('bf')),false)
 on conflict(role_code) do nothing;
-update public.access_roles set pin_hash=extensions.crypt('planta2026',extensions.gen_salt('bf')) where role_code='admin';
 update public.access_roles set display_name='Operario',enabled=true where role_code='operario';
 update public.access_roles set enabled=false where role_code like 'operario_%';
 
 create table if not exists public.inventory_items (
  id uuid primary key default gen_random_uuid(), product_code text unique not null, product_name text not null,
+ is_added boolean not null default false,
  unit text, warehouse_code text not null default '01', system_quantity numeric, unit_value numeric, total_value numeric, category text
 );
+alter table public.inventory_items add column if not exists is_added boolean not null default false;
+
 create table if not exists public.count_tasks (
  id uuid primary key default gen_random_uuid(), inventory_item_id uuid unique not null references public.inventory_items(id) on delete cascade,
  product_code text not null, product_name text not null, unit text, assigned_role text references public.access_roles(role_code),
@@ -68,12 +73,12 @@ begin
 end; $$;
 drop function if exists public.inventory_tasks(uuid,text,text);
 drop function if exists public.inventory_find_tasks(uuid,text,text);
-create function public.inventory_tasks(p_token uuid,p_state text default 'pending',p_search text default '') returns table(id uuid,product_code text,product_name text,unit text,counted_quantity numeric,observation text,counted_at date,assigned_role text,category text) language plpgsql security definer set search_path=public as $$
+create function public.inventory_tasks(p_token uuid,p_state text default 'pending',p_search text default '') returns table(id uuid,product_code text,product_name text,unit text,counted_quantity numeric,observation text,counted_at date,assigned_role text,category text,is_added boolean) language plpgsql security definer set search_path=public as $$
 declare role text:=public.session_role(p_token); admin boolean:=public.session_admin(p_token);
 begin
  if role is null then raise exception 'Sesión vencida'; end if;
- return query select t.id,t.product_code,t.product_name,t.unit,t.counted_quantity,t.observation,t.counted_at,t.assigned_role,i.category from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id
- where (admin or t.assigned_role=role) and (case when p_state='counted' then t.counted_quantity is not null else t.counted_quantity is null end)
+ return query select t.id,t.product_code,t.product_name,t.unit,t.counted_quantity,t.observation,t.counted_at,t.assigned_role,i.category,i.is_added from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id
+ where (admin or t.assigned_role=role) and (case when p_state='added' then i.is_added when p_state='missing' then not i.is_added and t.counted_quantity=0 when p_state='counted' then t.counted_quantity is not null else t.counted_quantity is null end)
  and (p_search='' or lower(t.product_code||' '||t.product_name) like '%'||lower(p_search)||'%') order by t.product_code;
 end; $$;
 create or replace function public.inventory_summary(p_token uuid) returns table(pending_count bigint,counted_count bigint) language plpgsql security definer set search_path=public as $$
@@ -86,16 +91,17 @@ create or replace function public.inventory_save_count(p_token uuid,p_task uuid,
 declare role text:=public.session_role(p_token); responsible text;
 begin
  if role is null then raise exception 'Sesión vencida'; end if;
+ if p_quantity is not null and (p_quantity<0 or p_quantity::text in ('NaN','Infinity','-Infinity')) then raise exception 'La cantidad debe ser un número mayor o igual a cero'; end if;
  select responsible_name into responsible from public.inventory_sessions where token=p_token;
  update public.count_tasks set counted_quantity=p_quantity, observation=nullif(trim(p_observation),''), counted_at=case when p_quantity is null then null else (now() at time zone 'America/Bogota')::date end, updated_at=now()
- where id=p_task;
+ where id=p_task and (public.session_admin(p_token) or assigned_role=role);
  if not found then raise exception 'Ítem no encontrado'; end if;
  insert into public.count_activity(task_id,actor_role,responsible_name,counted_quantity,observation) values(p_task,role,responsible,p_quantity,nullif(trim(p_observation),''));
 end; $$;
 drop function if exists public.inventory_admin_tasks(uuid);
-create function public.inventory_admin_tasks(p_token uuid) returns table(id uuid,product_code text,product_name text,unit text,category text,system_quantity numeric,unit_value numeric,warehouse_code text,assigned_role text,counted_quantity numeric,observation text,counted_at date,last_actor text,last_recorded_at timestamptz) language plpgsql security definer set search_path=public as $$
+create function public.inventory_admin_tasks(p_token uuid) returns table(id uuid,product_code text,product_name text,unit text,category text,system_quantity numeric,unit_value numeric,warehouse_code text,assigned_role text,counted_quantity numeric,observation text,counted_at date,last_actor text,last_recorded_at timestamptz,is_added boolean) language plpgsql security definer set search_path=public as $$
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
- return query select t.id,i.product_code,i.product_name,i.unit,i.category,i.system_quantity,i.unit_value,i.warehouse_code,t.assigned_role,t.counted_quantity,t.observation,t.counted_at,a.display_name,a.recorded_at from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id left join lateral (select coalesce(ca.responsible_name,ar.display_name) as display_name,ca.recorded_at from public.count_activity ca join public.access_roles ar on ar.role_code=ca.actor_role where ca.task_id=t.id order by ca.recorded_at desc,ca.id desc limit 1) a on true order by i.product_code; end; $$;
+ return query select t.id,i.product_code,i.product_name,i.unit,i.category,i.system_quantity,i.unit_value,i.warehouse_code,t.assigned_role,t.counted_quantity,t.observation,t.counted_at,a.display_name,a.recorded_at,i.is_added from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id left join lateral (select coalesce(ca.responsible_name,ar.display_name) as display_name,ca.recorded_at from public.count_activity ca join public.access_roles ar on ar.role_code=ca.actor_role where ca.task_id=t.id order by ca.recorded_at desc,ca.id desc limit 1) a on true order by i.product_code; end; $$;
 drop function if exists public.inventory_activity(uuid,integer);
 create function public.inventory_activity(p_token uuid,p_limit integer default 500) returns table(activity_id text,product_code text,product_name text,display_name text,counted_quantity numeric,observation text,recorded_at timestamptz) language plpgsql security definer set search_path=public as $$
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
@@ -139,3 +145,27 @@ do $seed$ declare catalog jsonb := $json$[{"code":"10000","name":"consumo","unit
 insert into public.inventory_items(product_code,product_name,unit,warehouse_code,system_quantity,unit_value,total_value,category) select code,name,unit,'01',quantity,unit_value,total_value,category from jsonb_to_recordset(catalog) as x(code text,name text,unit text,quantity numeric,unit_value numeric,total_value numeric,category text,role text) on conflict(product_code) do update set category=excluded.category;
 insert into public.count_tasks(inventory_item_id,product_code,product_name,unit,assigned_role) select i.id,i.product_code,i.product_name,i.unit,x.role from jsonb_to_recordset(catalog) as x(code text,name text,unit text,quantity numeric,unit_value numeric,total_value numeric,category text,role text) join public.inventory_items i on i.product_code=x.code on conflict(inventory_item_id) do update set product_code=excluded.product_code,product_name=excluded.product_name,unit=excluded.unit,assigned_role=excluded.assigned_role;
 end $seed$;
+
+-- El ID de solicitud evita duplicados al reintentar después de una pérdida de conexión.
+create or replace function public.inventory_add_material(p_token uuid,p_request uuid,p_name text,p_unit text,p_category text,p_quantity numeric,p_observation text)
+returns uuid language plpgsql security definer set search_path=public as $$
+declare role text:=public.session_role(p_token); task uuid; code text;
+begin
+ if role is null then raise exception 'Sesión vencida'; end if;
+ if p_request is null or coalesce(trim(p_name),'')='' or coalesce(trim(p_unit),'')='' or coalesce(trim(p_category),'')='' then raise exception 'Complete nombre, unidad y sección'; end if;
+ if p_quantity is null or p_quantity<=0 or p_quantity::text in ('NaN','Infinity','-Infinity') then raise exception 'Ingrese la cantidad encontrada, mayor que cero'; end if;
+ if length(p_name)>240 or length(p_unit)>30 or length(p_category)>100 or length(p_observation)>2000 then raise exception 'Revise la longitud de los campos'; end if;
+ perform pg_advisory_xact_lock(hashtextextended(p_request::text,0));
+ select t.id into task from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id where i.id=p_request and i.is_added;
+ if found then return task; end if;
+ code:='FIS-'||p_request::text;
+ insert into public.inventory_items(id,product_code,product_name,unit,category,is_added)
+ values(p_request,code,trim(p_name),trim(p_unit),trim(p_category),true);
+ insert into public.count_tasks(inventory_item_id,product_code,product_name,unit,assigned_role)
+ values(p_request,code,trim(p_name),trim(p_unit),'operario') returning id into task;
+ perform public.inventory_save_count(p_token,task,p_quantity,p_observation);
+ return task;
+end; $$;
+revoke all on function public.inventory_add_material(uuid,uuid,text,text,text,numeric,text) from public;
+grant execute on function public.inventory_add_material(uuid,uuid,text,text,text,numeric,text),public.inventory_tasks(uuid,text,text),public.inventory_admin_tasks(uuid),public.inventory_save_count(uuid,uuid,numeric,text) to anon,authenticated;
+commit;
