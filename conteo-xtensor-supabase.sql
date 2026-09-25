@@ -168,4 +168,32 @@ begin
 end; $$;
 revoke all on function public.inventory_add_material(uuid,uuid,text,text,text,numeric,text) from public;
 grant execute on function public.inventory_add_material(uuid,uuid,text,text,text,numeric,text),public.inventory_tasks(uuid,text,text),public.inventory_admin_tasks(uuid),public.inventory_save_count(uuid,uuid,numeric,text) to anon,authenticated;
+-- Correcciones del catálogo físico: nunca modifican ni eliminan referencias Siigo.
+create or replace function public.inventory_rename_added(p_token uuid,p_task uuid,p_name text)
+returns void language plpgsql security definer set search_path=public as $$
+declare role text:=public.session_role(p_token); item uuid;
+begin
+ if role is null then raise exception 'Sesión vencida'; end if;
+ if coalesce(trim(p_name),'')='' or length(trim(p_name))>240 then raise exception 'Ingrese un nombre de hasta 240 caracteres'; end if;
+ select t.inventory_item_id into item from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id
+ where t.id=p_task and i.is_added and (public.session_admin(p_token) or t.assigned_role=role) for update of t;
+ if not found then raise exception 'Material agregado no encontrado o sin permiso'; end if;
+ update public.inventory_items set product_name=trim(p_name) where id=item;
+ update public.count_tasks set product_name=trim(p_name),updated_at=now() where id=p_task;
+end; $$;
+
+create or replace function public.inventory_delete_added(p_token uuid,p_task uuid)
+returns void language plpgsql security definer set search_path=public as $$
+declare role text:=public.session_role(p_token); item uuid;
+begin
+ if role is null then raise exception 'Sesión vencida'; end if;
+ select t.inventory_item_id into item from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id
+ where t.id=p_task and i.is_added and (public.session_admin(p_token) or t.assigned_role=role) for update of t;
+ if not found then raise exception 'Material agregado no encontrado o sin permiso'; end if;
+ -- Las relaciones ON DELETE CASCADE eliminan también su conteo y bitácora.
+ delete from public.inventory_items where id=item and is_added;
+end; $$;
+revoke all on function public.inventory_rename_added(uuid,uuid,text),public.inventory_delete_added(uuid,uuid) from public;
+grant execute on function public.inventory_rename_added(uuid,uuid,text),public.inventory_delete_added(uuid,uuid) to anon,authenticated;
+notify pgrst, 'reload schema';
 commit;
