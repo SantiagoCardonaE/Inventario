@@ -60,7 +60,8 @@ declare r public.access_roles%rowtype; t uuid;
 begin
  select * into r from public.access_roles as ar where ar.role_code=p_role;
  if not found or not r.enabled or (r.is_admin and extensions.crypt(p_pin,r.pin_hash)<>r.pin_hash) then raise exception 'Perfil o PIN incorrecto'; end if;
- if not r.is_admin and coalesce(trim(p_responsible),'') not in ('Daniel García','Germán Villada','Daniel Duque','Juan Felipe','Cristian Rodríguez') then raise exception 'Seleccione la persona responsable del registro'; end if;
+ if trim(p_responsible)='Juan Felipe' then p_responsible:='Juan Martínez'; end if;
+ if not r.is_admin and coalesce(trim(p_responsible),'') not in ('Daniel García','Germán Villada','Daniel Duque','Juan Martínez','Cristian Rodríguez','Ariel Valencia','Luis Betancurth','José Gaviria','César Rendón') then raise exception 'Seleccione la persona responsable del registro'; end if;
  delete from public.inventory_sessions where expires_at<now();
  insert into public.inventory_sessions(role_code,responsible_name) values(r.role_code,nullif(trim(p_responsible),'')) returning inventory_sessions.token into t;
  return query select t,r.role_code,r.display_name,r.is_admin,nullif(trim(p_responsible),'');
