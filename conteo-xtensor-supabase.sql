@@ -78,7 +78,7 @@ declare role text:=public.session_role(p_token); admin boolean:=public.session_a
 begin
  if role is null then raise exception 'Sesión vencida'; end if;
  return query select t.id,t.product_code,t.product_name,t.unit,t.counted_quantity,t.observation,t.counted_at,t.assigned_role,i.category,i.is_added from public.count_tasks t join public.inventory_items i on i.id=t.inventory_item_id
- where (admin or t.assigned_role=role) and (case when p_state='added' then i.is_added when p_state='missing' then not i.is_added and t.counted_quantity=0 when p_state='counted' then t.counted_quantity is not null else t.counted_quantity is null end)
+ where (admin or t.assigned_role=role) and (case when p_state='all' then true when p_state='added' then i.is_added when p_state='missing' then not i.is_added and t.counted_quantity=0 when p_state='counted' then t.counted_quantity is not null else t.counted_quantity is null end)
  and (p_search='' or lower(t.product_code||' '||t.product_name) like '%'||lower(p_search)||'%') order by t.product_code;
 end; $$;
 create or replace function public.inventory_summary(p_token uuid) returns table(pending_count bigint,counted_count bigint) language plpgsql security definer set search_path=public as $$
