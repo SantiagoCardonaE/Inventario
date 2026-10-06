@@ -107,6 +107,32 @@ create function public.inventory_activity(p_token uuid,p_limit integer default 5
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
  return query select ca.id::text,t.product_code,t.product_name,coalesce(ca.responsible_name,ar.display_name),ca.counted_quantity,ca.observation,ca.recorded_at from public.count_activity ca join public.count_tasks t on t.id=ca.task_id join public.access_roles ar on ar.role_code=ca.actor_role order by ca.recorded_at desc,ca.id desc limit greatest(1,least(coalesce(p_limit,500),2000)); end; $$;
 
+-- Una respuesta JSON evita truncar el catálogo o el día por el límite de filas REST.
+-- El reporte completo comparte una sola fecha y una instantánea de la base de datos.
+alter function public.inventory_admin_tasks(uuid) stable;
+create or replace function public.inventory_daily_report(p_token uuid)
+returns jsonb language plpgsql stable security definer set search_path=public as $$
+begin
+ if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
+ return jsonb_build_object(
+  'date',(now() at time zone 'America/Bogota')::date,
+  'generated_at',now(),
+  'items',coalesce((select jsonb_agg(to_jsonb(t) order by t.product_code) from public.inventory_admin_tasks(p_token) t),'[]'::jsonb),
+  'activity',coalesce((select jsonb_agg(to_jsonb(a) order by a.recorded_at,a.event_id) from (
+   select ca.id as event_id,ca.id::text as activity_id,t.product_code,t.product_name,i.category,t.unit,i.is_added,
+          ca.counted_quantity,ca.observation,coalesce(ca.responsible_name,ar.display_name) as display_name,ca.recorded_at
+   from public.count_activity ca
+   join public.count_tasks t on t.id=ca.task_id
+   join public.inventory_items i on i.id=t.inventory_item_id
+   join public.access_roles ar on ar.role_code=ca.actor_role
+   where ca.recorded_at>=((now() at time zone 'America/Bogota')::date::timestamp at time zone 'America/Bogota')
+     and ca.recorded_at<=now()
+  ) a),'[]'::jsonb)
+ );
+end; $$;
+revoke all on function public.inventory_daily_report(uuid) from public;
+grant execute on function public.inventory_daily_report(uuid) to anon,authenticated;
+
 -- Solo el administrador puede eliminar un registro y reconstruir el conteo vigente.
 create or replace function public.inventory_delete_activity(p_token uuid,p_activity bigint)
 returns void language plpgsql security definer set search_path=public as $$
