@@ -107,6 +107,74 @@ create function public.inventory_activity(p_token uuid,p_limit integer default 5
 begin if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
  return query select ca.id::text,t.product_code,t.product_name,coalesce(ca.responsible_name,ar.display_name),ca.counted_quantity,ca.observation,ca.recorded_at from public.count_activity ca join public.count_tasks t on t.id=ca.task_id join public.access_roles ar on ar.role_code=ca.actor_role order by ca.recorded_at desc,ca.id desc limit greatest(1,least(coalesce(p_limit,500),2000)); end; $$;
 
+-- Valoraciones manuales: conserva precios Siigo, conteos y unidades originales.
+create table if not exists public.inventory_manual_valuations (
+ inventory_item_id uuid primary key references public.inventory_items(id) on delete cascade,
+ purchase_total_cop numeric not null check(purchase_total_cop>0 and purchase_total_cop::text not in ('NaN','Infinity','-Infinity')),
+ purchased_units numeric not null check(purchased_units>0 and purchased_units::text not in ('NaN','Infinity','-Infinity')),
+ total_weight_kg numeric check(total_weight_kg is null or (total_weight_kg>0 and total_weight_kg::text not in ('NaN','Infinity','-Infinity'))),
+ unit_snapshot text,
+ version integer not null default 1 check(version>0),
+ actor text not null,
+ updated_at timestamptz not null default now()
+);
+alter table public.inventory_manual_valuations enable row level security;
+revoke all on table public.inventory_manual_valuations from public,anon,authenticated;
+
+create or replace function public.inventory_valuations(p_token uuid)
+returns table(id uuid,valuation_total_cop numeric,valuation_units numeric,valuation_weight_kg numeric,valuation_unit text,valuation_version integer,valuation_updated_at timestamptz,valuation_actor text,manual_unit_value numeric,valuation_stale boolean)
+language plpgsql stable security definer set search_path=public as $$
+begin
+ if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
+ return query
+ select t.id,v.purchase_total_cop,v.purchased_units,v.total_weight_kg,v.unit_snapshot,coalesce(v.version,0),v.updated_at,v.actor,
+  case when v.inventory_item_id is not null
+         and v.unit_snapshot is not null
+         and v.unit_snapshot is not distinct from i.unit
+         and t.unit is not distinct from i.unit
+         and (i.unit_value is null or i.unit_value<=0 or i.unit_value::text in ('NaN','Infinity','-Infinity'))
+       then case when lower(trim(i.unit))='kg' and v.total_weight_kg>0
+                 then v.purchase_total_cop/v.total_weight_kg
+                 else v.purchase_total_cop/v.purchased_units end
+       else null::numeric end,
+  v.inventory_item_id is not null and (v.unit_snapshot is null or v.unit_snapshot is distinct from i.unit or t.unit is distinct from i.unit)
+ from public.count_tasks t
+ join public.inventory_items i on i.id=t.inventory_item_id
+ left join public.inventory_manual_valuations v on v.inventory_item_id=i.id
+ order by t.product_code;
+end; $$;
+
+create or replace function public.inventory_save_valuation(
+ p_token uuid,p_task uuid,p_total_cop numeric,p_units numeric,p_weight_kg numeric,p_expected_unit text,p_version integer
+)
+returns integer language plpgsql security definer set search_path=public as $$
+declare task public.count_tasks%rowtype; item public.inventory_items%rowtype; current_version integer; next_version integer; actor_name text;
+begin
+ if not public.session_admin(p_token) then raise exception 'Solo administrador'; end if;
+ if p_total_cop is null or p_total_cop<=0 or p_total_cop::text in ('NaN','Infinity','-Infinity') then raise exception 'Ingrese un precio total en COP mayor que cero'; end if;
+ if p_units is null or p_units<=0 or p_units::text in ('NaN','Infinity','-Infinity') then raise exception 'Ingrese una cantidad comprada mayor que cero, en la unidad del inventario'; end if;
+ if p_weight_kg is not null and (p_weight_kg<=0 or p_weight_kg::text in ('NaN','Infinity','-Infinity')) then raise exception 'El peso total debe estar vacío o ser mayor que cero, en kg'; end if;
+ select * into task from public.count_tasks t where t.id=p_task for update;
+ if not found then raise exception 'Material no encontrado'; end if;
+ select * into item from public.inventory_items i where i.id=task.inventory_item_id for update;
+ if not found then raise exception 'Material no encontrado'; end if;
+ if item.unit_value>0 and item.unit_value::text not in ('NaN','Infinity','-Infinity') then raise exception 'El material ya tiene un precio de Siigo. No se modifica su valoración original.'; end if;
+ if item.unit is distinct from p_expected_unit or task.unit is distinct from p_expected_unit then raise exception 'La unidad cambió en otro dispositivo. Actualice y vuelva a abrir la valoración.'; end if;
+ if coalesce(trim(item.unit),'')='' then raise exception 'Asigne una unidad al material antes de valorarlo'; end if;
+ select v.version into current_version from public.inventory_manual_valuations v where v.inventory_item_id=item.id for update;
+ if p_version is distinct from coalesce(current_version,0) then raise exception 'Otra persona modificó esta valoración. Actualice y vuelva a abrirla antes de guardar.'; end if;
+ select coalesce(nullif(trim(s.responsible_name),''),r.display_name) into actor_name
+ from public.inventory_sessions s join public.access_roles r on r.role_code=s.role_code where s.token=p_token;
+ insert into public.inventory_manual_valuations as stored(inventory_item_id,purchase_total_cop,purchased_units,total_weight_kg,unit_snapshot,version,actor,updated_at)
+ values(item.id,p_total_cop,p_units,p_weight_kg,item.unit,1,actor_name,now())
+ on conflict(inventory_item_id) do update set purchase_total_cop=excluded.purchase_total_cop,purchased_units=excluded.purchased_units,total_weight_kg=excluded.total_weight_kg,
+  unit_snapshot=excluded.unit_snapshot,version=stored.version+1,actor=excluded.actor,updated_at=now()
+ returning stored.version into next_version;
+ return next_version;
+end; $$;
+revoke all on function public.inventory_valuations(uuid),public.inventory_save_valuation(uuid,uuid,numeric,numeric,numeric,text,integer) from public;
+grant execute on function public.inventory_valuations(uuid),public.inventory_save_valuation(uuid,uuid,numeric,numeric,numeric,text,integer) to anon,authenticated;
+
 -- Una respuesta JSON evita truncar el catálogo o el día por el límite de filas REST.
 -- El reporte completo comparte una sola fecha y una instantánea de la base de datos.
 alter function public.inventory_admin_tasks(uuid) stable;
@@ -117,7 +185,9 @@ begin
  return jsonb_build_object(
   'date',(now() at time zone 'America/Bogota')::date,
   'generated_at',now(),
-  'items',coalesce((select jsonb_agg(to_jsonb(t) order by t.product_code) from public.inventory_admin_tasks(p_token) t),'[]'::jsonb),
+  'items',coalesce((select jsonb_agg(to_jsonb(t)||coalesce(to_jsonb(v),'{}'::jsonb) order by t.product_code)
+                    from public.inventory_admin_tasks(p_token) t
+                    left join public.inventory_valuations(p_token) v on v.id=t.id),'[]'::jsonb),
   'activity',coalesce((select jsonb_agg(to_jsonb(a) order by a.recorded_at,a.event_id) from (
    select ca.id as event_id,ca.id::text as activity_id,t.product_code,t.product_name,i.category,t.unit,i.is_added,
           ca.counted_quantity,ca.observation,coalesce(ca.responsible_name,ar.display_name) as display_name,ca.recorded_at
@@ -214,7 +284,7 @@ create or replace function public.inventory_update_added_unit(
  p_token uuid,p_task uuid,p_unit text,p_expected_unit text,p_expected_quantity numeric,p_confirmed boolean
 )
 returns void language plpgsql security definer set search_path=public as $$
-declare role text:=public.session_role(p_token); task public.count_tasks%rowtype; item public.inventory_items%rowtype;
+declare role text:=public.session_role(p_token); task public.count_tasks%rowtype; item public.inventory_items%rowtype; actor_name text;
  new_unit text:=trim(regexp_replace(p_unit,'\s+',' ','g'));
 begin
  if role is null then raise exception 'Sesión vencida'; end if;
@@ -230,6 +300,10 @@ begin
   raise exception 'La unidad o la cantidad cambió en otro dispositivo. Cierre esta ventana, actualice y vuelva a abrir el material antes de cambiar la unidad.';
  end if;
  if new_unit is not distinct from item.unit then return; end if;
+ -- Invalidación persistente: A→B→A no reactiva un precio con una unidad anterior.
+ select coalesce(nullif(trim(s.responsible_name),''),r.display_name) into actor_name
+ from public.inventory_sessions s join public.access_roles r on r.role_code=s.role_code where s.token=p_token;
+ update public.inventory_manual_valuations set unit_snapshot=null,version=version+1,actor=actor_name,updated_at=now() where inventory_item_id=item.id;
  update public.inventory_items set unit=new_unit where id=item.id;
  update public.count_tasks set unit=new_unit,updated_at=now() where id=task.id;
 end; $$;
