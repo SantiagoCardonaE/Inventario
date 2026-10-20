@@ -208,6 +208,34 @@ begin
  update public.count_tasks set product_name=trim(p_name),updated_at=now() where id=p_task;
 end; $$;
 
+-- Cambio de unidad únicamente para materiales físicos agregados fuera de Siigo.
+-- La cantidad no se convierte; exige confirmación y evita sobrescribir cambios remotos.
+create or replace function public.inventory_update_added_unit(
+ p_token uuid,p_task uuid,p_unit text,p_expected_unit text,p_expected_quantity numeric,p_confirmed boolean
+)
+returns void language plpgsql security definer set search_path=public as $$
+declare role text:=public.session_role(p_token); task public.count_tasks%rowtype; item public.inventory_items%rowtype;
+ new_unit text:=trim(regexp_replace(p_unit,'\s+',' ','g'));
+begin
+ if role is null then raise exception 'Sesión vencida'; end if;
+ if p_confirmed is distinct from true then raise exception 'Confirme el cambio de unidad antes de guardar'; end if;
+ if coalesce(new_unit,'')='' or length(new_unit)>30 then raise exception 'Ingrese una unidad de medida de hasta 30 caracteres'; end if;
+ select * into task from public.count_tasks t
+ where t.id=p_task and (public.session_admin(p_token) or t.assigned_role=role) for update;
+ if not found then raise exception 'Material no encontrado o sin permiso'; end if;
+ select * into item from public.inventory_items i where i.id=task.inventory_item_id for update;
+ if not found or not item.is_added then raise exception 'Solo se permite cambiar la unidad de materiales agregados fuera de Siigo'; end if;
+ if item.unit is distinct from p_expected_unit or task.unit is distinct from p_expected_unit
+    or task.counted_quantity is distinct from p_expected_quantity then
+  raise exception 'La unidad o la cantidad cambió en otro dispositivo. Cierre esta ventana, actualice y vuelva a abrir el material antes de cambiar la unidad.';
+ end if;
+ if new_unit is not distinct from item.unit then return; end if;
+ update public.inventory_items set unit=new_unit where id=item.id;
+ update public.count_tasks set unit=new_unit,updated_at=now() where id=task.id;
+end; $$;
+revoke all on function public.inventory_update_added_unit(uuid,uuid,text,text,numeric,boolean) from public;
+grant execute on function public.inventory_update_added_unit(uuid,uuid,text,text,numeric,boolean) to anon,authenticated;
+
 create or replace function public.inventory_delete_added(p_token uuid,p_task uuid)
 returns void language plpgsql security definer set search_path=public as $$
 declare role text:=public.session_role(p_token); item uuid;
